@@ -1,83 +1,127 @@
 # Market Data Backend — Comprehensive Code Review
 
 **Date:** 2026-04-23
-**Reviewer:** Claude (claude-sonnet-4-6)
-**Branch:** `claude/issue-4-20260423-0319`
-**Scope:** `backend/app/market/` (8 source files) and `backend/tests/market/` (7 test files)
-**Prior review archived at:** `planning/archive/MARKET_DATA_REVIEW.md` (2026-02-10)
+**Reviewer:** Claude (claude-opus-4-6)
+**Scope:** `backend/app/market/` (8 source files, 1 `__init__.py`) and `backend/tests/market/` (7 test files)
+**Prior reviews:** `planning/archive/MARKET_DATA_REVIEW.md` (2026-02-10), `planning/REVIEW.md` (2026-04-19)
+**Design documents cross-referenced:** `MARKET_DATA_DESIGN.md`, `MARKET_INTERFACE.md`, `MARKET_SIMULATOR.md`, `MASSIVE_API.md`, `PLAN.md`
 
 ---
 
 ## 1. Test Results
 
-**Prior recorded run (2026-04-19, from `planning/REVIEW.md`):** 168 tests, 168 passed.
+**192 tests collected. 190 passed, 2 failed, SSE stream tests hang.**
 
-Note: `uv` was not available in the current CI sandbox, preventing a fresh test run here. All assertions below are from static code analysis cross-referenced against the design documents. Where discrepancies between code and tests exist, they are called out explicitly.
+| Test suite | Tests | Result |
+|---|---|---|
+| `tests/market/test_models.py` | 11 | All pass |
+| `tests/market/test_cache.py` | 16 | All pass |
+| `tests/market/test_simulator.py` | 25 | All pass |
+| `tests/market/test_simulator_source.py` | 13 | **1 failure** |
+| `tests/market/test_massive.py` | 18 | All pass |
+| `tests/market/test_factory.py` | 7 | All pass |
+| `tests/market/test_stream.py` | 8 | **Hang** (timeout after 45s) |
+| `tests/api/` | 22 | All pass |
+| `tests/db/` | 33 | All pass |
+| `tests/llm/` | 19 | **1 failure** (outside market scope) |
 
-**Lint status (from prior run):** Source code passes `ruff` cleanly. Five unused-import warnings remain in test files (`pytest`, `math`, `asyncio`).
+### 1.1 Failure: `test_no_simulator_seed_is_non_deterministic` (market)
+
+**File:** `tests/market/test_simulator_source.py:172-196`
+
+```python
+async def test_no_simulator_seed_is_non_deterministic(self):
+    ...
+    await src_a.start(["AAPL"])
+    for _ in range(50):
+        src_a._sim.step()          # advances internal state
+    prices_a = cache_a.get_price("AAPL")  # reads from cache
+    ...
+    assert prices_a != prices_b    # FAILS: both are 190.0
+```
+
+**Root cause:** `src_a._sim.step()` advances the simulator's internal prices but does **not** write to the cache. The cache is only updated by the `_run_loop` background task. With `update_interval=10.0`, the background task never fires during the test. Both `cache_a.get_price("AAPL")` and `cache_b.get_price("AAPL")` return the initial seed price (190.00), so `assert prices_a != prices_b` fails deterministically.
+
+**Fix:** Compare internal simulator prices (`src_a._sim.get_price("AAPL")`) instead of reading from the cache, or use a short `update_interval` with `asyncio.sleep()` to let the background loop fire.
+
+### 1.2 Hang: `tests/market/test_stream.py`
+
+**Root cause:** `test_empty_cache_emits_no_data_frames` hangs. The test calls `r.iter_text()` in a loop expecting 10 chunks, but with an empty cache, the SSE generator only yields the `retry: 1000\n\n` directive once and then loops silently (no data to emit). `iter_text()` blocks waiting for a second chunk that never comes. Since the SSE generator never yields again and the client never disconnects, the test hangs indefinitely.
+
+This also blocks all subsequent stream tests in the module from running.
+
+**Fix:** Use a timeout on the streaming read, or restructure the test to break after receiving the retry directive rather than waiting for 10 chunks from a generator that will only ever produce one.
+
+### 1.3 Failure: `test_live_path_parses_structured_output` (LLM, out of scope)
+
+**File:** `tests/llm/test_client.py:49` — `KeyError: 'extra_body'`. Not a market data issue; noted for completeness.
 
 ---
 
 ## 2. Fixes Since the Archived Review (2026-02-10)
 
-The previous review flagged six issues. All have been addressed in the current implementation:
+The archived review flagged six issues. All have been addressed:
 
 | Issue | Status |
 |---|---|
 | Missing `[tool.hatch.build.targets.wheel]` in `pyproject.toml` | ✅ Fixed |
-| `_generate_events` annotated `-> None` instead of `-> AsyncGenerator[str, None]` | ✅ Fixed |
+| `_generate_events` annotated `-> None` instead of `-> AsyncGenerator[str, None]` | ✅ Fixed — now `AsyncGenerator[str, None]` |
 | `PriceCache.version` read outside lock | ✅ Fixed — now reads under `threading.Lock` |
-| `SimulatorDataSource.get_tickers()` reached into `_sim._tickers` (private) | ✅ Fixed — `GBMSimulator.get_tickers()` public method added |
+| `SimulatorDataSource.get_tickers()` reached into `_sim._tickers` | ✅ Fixed — `GBMSimulator.get_tickers()` public method added |
 | Module-level `router` footgun in `create_stream_router` | ✅ Fixed — fresh `APIRouter` per call |
-| 5 failing Massive tests due to `massive` package absent | ✅ Resolved — `massive>=1.0.0` is now a core dependency in `pyproject.toml`; tests restructured to patch `_fetch_snapshots` directly |
+| 5 failing Massive tests due to `massive` package absent | ✅ Fixed — tests restructured to patch `_fetch_snapshots` directly |
 
-These are all the right fixes. The code quality has measurably improved.
+All the right fixes, well executed. Prior review issues are closed.
 
 ---
 
 ## 3. Architecture Assessment
 
-The market data subsystem is cleanly designed and largely matches the specification in `MARKET_DATA_DESIGN.md`.
+The market data subsystem is cleanly designed with clear single-responsibility modules:
 
 ```
 MarketDataSource (ABC, interface.py)
 ├── SimulatorDataSource  → GBMSimulator (correlated GBM)
 └── MassiveDataSource    → Massive REST snapshot API
         │
-        ▼
-   PriceCache (thread-safe, versioned)
+        ▼  writes
+   PriceCache (thread-safe, versioned, cache.py)
         │
-        ▼
-   SSE /api/stream/prices → Frontend EventSource
+        ▼  reads
+   SSE /api/stream/prices (stream.py) → Frontend EventSource
 ```
 
-**Strengths:**
-- Clear single-responsibility split across 8 focused modules
-- `PriceUpdate` is correctly `frozen=True, slots=True` — immutable, memory-efficient
-- `PriceCache` uses `threading.Lock` (not `asyncio.Lock`) to handle Massive's thread-dispatch path
-- Version counter correctly read under lock (no-GIL safe)
-- GBM formula correctly implemented: `S * exp((mu - 0.5*sigma²)*dt + sigma*sqrt(dt)*Z)`
-- Cholesky decomposition for cross-sector correlation is mathematically sound
-- Both data sources: exception resilience, idempotent start/stop, eager cache seeding
-- SSE: version-driven emission (not timer-driven), `retry:1000` directive, nginx buffering disabled
-- Factory correctly routes on env var, returns unstarted source
-- `__init__.py` exports exactly the right public surface
+### Strengths
+
+| Area | Assessment |
+|---|---|
+| Module structure | 8 focused files with a clean `__init__.py` exporting exactly 5 public names |
+| `PriceUpdate` | `frozen=True, slots=True` — immutable, memory-efficient; derived properties can never desync |
+| `PriceCache` | `threading.Lock` for both asyncio and thread-pool writers; version counter under lock (no-GIL safe) |
+| GBM formula | Correctly implements: `S * exp((mu - 0.5σ²)dt + σ√dt·Z)` — prices always positive |
+| Cholesky correlation | Mathematically sound; sector groups produce visible co-movement without identical lines |
+| Event shocks | 0.001/tick creates visible drama; correctly multiplicative (preserves lognormal structure) |
+| Idempotent lifecycle | `start()`/`stop()` on both sources safe to call multiple times |
+| Eager cache seeding | `SimulatorDataSource` seeds on `start()` and `add_ticker()` — no blank first SSE frame |
+| Exception resilience | Both `_run_loop` and `_poll_once` catch all exceptions and continue |
+| SSE version gating | Frames only emitted when `cache.version != last_version` — efficient for slow sources |
+| SSE wire format | Matches PLAN.md §8 exactly (JSON array, all required fields) |
+| Factory env routing | Clean, matches PLAN.md §5; returns unstarted source |
+| Massive 429 handling | 60s cooldown on `asyncio.get_event_loop().time()` — correct |
+| Massive malformed snap | Per-ticker exception handling; siblings unaffected |
+| Test coverage | Strong happy-path coverage with good fixture reuse; 5K-step correlation test is a nice touch |
 
 ---
 
 ## 4. Issues Found
 
-### 4.1 Timestamp Divisor: Milliseconds vs Nanoseconds (Severity: High)
+### 4.1 Timestamp Divisor: Milliseconds vs Nanoseconds (Severity: HIGH)
 
 **File:** `backend/app/market/massive_client.py:18-27`
 
 ```python
 def _parse_timestamp(ts: int | float | None) -> float | None:
-    """Convert a Massive snapshot timestamp to Unix seconds.
-
-    Snapshot timestamps may be in milliseconds (ms) from the Massive SDK.
-    We convert to seconds for the PriceCache.
-    """
+    """...Snapshot timestamps may be in milliseconds (ms) from the Massive SDK..."""
     if ts is None:
         return None
     # Massive SDK returns milliseconds; divide by 1000 to get seconds.
@@ -86,94 +130,81 @@ def _parse_timestamp(ts: int | float | None) -> float | None:
 
 The planning documentation (`MARKET_DATA_DESIGN.md §7.2`, `MASSIVE_API.md` response shape) explicitly states that Massive snapshot timestamps (`tickers[i].updated`, `tickers[i].lastTrade.t`) are **nanoseconds**, not milliseconds. The correct divisor is `1e9`, not `1000`.
 
-The current implementation would produce timestamps from the year ~57,000 for nanosecond inputs (e.g., `1_776_321_000_120_000_000 / 1000 = 1_776_321_000_120.0` seconds ≈ year 58,400). This silently corrupts every SSE frame in Massive mode.
+With nanosecond input (e.g., `1_776_321_000_120_000_000 / 1000 = 1_776_321_000_120.0` seconds ≈ year 58,400), this silently produces garbage timestamps in every SSE frame when running in Massive mode. `MASSIVE_API.md` calls this out explicitly: *"Verify at runtime and fix the divisor if necessary."*
 
-The design document in `MASSIVE_API.md` notes this explicitly: *"the current MassiveDataSource divides last_trade.timestamp by 1000, assuming milliseconds. Snapshot responses use nanoseconds. Verify at runtime and fix the divisor if necessary."*
+The test `test_timestamp_conversion` passes a millisecond value (`1707580800000`) and asserts the ms-to-seconds result (`1707580800.0`), which is self-consistent but validates the **wrong behavior**. If the real API returns nanoseconds, this test masks the bug.
 
-The test `test_timestamp_conversion` validates the ms→seconds path (passing `1707580800000` and asserting `1707580800.0`), which is self-consistent but validates the wrong behavior. If the real Massive API returns nanoseconds, this test would mask the bug.
+The `MARKET_DATA_DESIGN.md` specifies the function should be named `_ns_to_seconds` and divide by `1e9`.
 
-**Fix:** Change divisor to `1e9` and update the test to use a realistic nanosecond timestamp. Also rename the helper to `_ns_to_seconds` to match the design doc.
+**Fix:** Change divisor to `1e9`, rename function to `_ns_to_seconds`, update docstring, and update the test to use a realistic nanosecond timestamp.
 
----
+### 4.2 SSE Stream Test Hangs (Severity: HIGH)
 
-### 4.2 Factory No Longer Lazy-Imports MassiveDataSource (Severity: Medium)
+**File:** `tests/market/test_stream.py:107-123` — `test_empty_cache_emits_no_data_frames`
 
-**File:** `backend/app/market/factory.py:8-9`
+As described in §1.2, this test blocks forever because `iter_text()` waits for chunks the generator will never produce. This prevents the entire stream test suite (8 tests) from running, which means SSE behavior is effectively **untested in CI**.
+
+**Fix:** Add a timeout mechanism to `_read_until_data`, or restructure the empty-cache test to break after reading the retry directive. For example, read a single chunk, confirm it contains `retry: 1000`, confirm it doesn't contain `data:`, and return.
+
+### 4.3 Watchlist Atomicity — No Compensating Rollback (Severity: MEDIUM)
+
+**File:** `backend/app/watchlist_api.py:66-76, 79-91`
+
+The design document (`MARKET_DATA_DESIGN.md §11.2`) specifies a DB-first/rollback pattern:
+
+```python
+entry_id = await insert_watchlist_entry(...)
+try:
+    await source.add_ticker(ticker)
+except Exception:
+    await delete_watchlist_entry(entry_id)   # rollback
+    raise HTTPException(500, ...)
+```
+
+The actual implementation does:
+
+```python
+added = db.watchlist.add_ticker(ticker)      # DB first ✓
+if not added:
+    raise HTTPException(409, ...)
+await state.market_source.add_ticker(ticker)  # No try/except, no rollback ✗
+```
+
+If `market_source.add_ticker()` raises, the DB row is written but the live market source hasn't added the ticker. The DB and live stream are inconsistent until restart. Similarly, `remove_watchlist` does not check for open positions before calling `source.remove_ticker()` (per `MARKET_DATA_DESIGN.md §11.3`), which would cause stale portfolio valuations for held tickers.
+
+This was also flagged as HIGH in `planning/REVIEW.md` (finding #2) and remains unaddressed.
+
+**Fix:** Wrap `market_source.add_ticker` / `remove_ticker` in try/except with DB rollback. Add position check before removing price tracking on watchlist removal.
+
+### 4.4 Factory No Longer Lazy-Imports MassiveDataSource (Severity: MEDIUM)
+
+**File:** `backend/app/market/factory.py:8-11`
 
 ```python
 from .massive_client import MassiveDataSource
 from .simulator import SimulatorDataSource
 ```
 
-The design document (`MARKET_DATA_DESIGN.md §8`, `MARKET_INTERFACE.md §Factory`) specifies that `MassiveDataSource` should be lazily imported inside `create_market_data_source()` so the `massive` SDK is not required for simulator-only users. The current implementation imports both `MassiveDataSource` and `SimulatorDataSource` at module load time.
+The design doc (`MARKET_DATA_DESIGN.md §8`, `MARKET_INTERFACE.md §Factory`) specifies that `MassiveDataSource` should be lazily imported inside `create_market_data_source()` so the `massive` SDK is not required for simulator-only users. The current implementation imports both at module load time.
 
-The practical impact is mitigated because:
-1. `massive>=1.0.0` is now a core (non-optional) dependency in `pyproject.toml`
-2. The actual `from massive import RESTClient` lazy import still lives inside `MassiveDataSource.start()`
+The practical impact is mitigated because `massive>=1.0.0` is now a core dependency in `pyproject.toml`, and the actual `from massive import RESTClient` lazy import still lives inside `MassiveDataSource.start()`. However, `__init__.py` imports from `factory.py`, which imports from `massive_client.py`, which imports from `cache.py` and `interface.py` — so `import app.market` now transitively loads `massive_client.py` even for simulator-only users. The design doc proposed `massive` as an optional extra (`project.optional-dependencies.massive`), which is incompatible with this eager import.
 
-However, the architectural principle is violated: importing `factory.py` always loads `massive_client.py`, even when no Massive key is configured. The `pyproject.toml` comment in the design doc proposed making `massive` an optional extra (`project.optional-dependencies.massive`). That is incompatible with the current eager import in the factory.
+**Fix:** Either (a) accept `massive` as a core dependency and document the decision, or (b) restore the lazy import inside `create_market_data_source()` and move `massive` to an optional extra.
 
-**Fix:** Either (a) keep `massive` as a core dependency and accept the eager import, or (b) restore the lazy import inside `create_market_data_source()` and move `massive` back to an optional extra.
+### 4.5 Interface Docstring Contradicts Implementations (Severity: LOW)
 
----
-
-### 4.3 Watchlist Atomicity — No Compensating Rollback (Severity: Medium)
-
-**File:** `backend/app/watchlist_api.py:66-76, 84-91`
-
-The design document (`MARKET_DATA_DESIGN.md §11.2`) specifies a DB-first/rollback pattern:
+**File:** `backend/app/market/interface.py:26-30`
 
 ```python
-# DB first.
-entry_id = await insert_watchlist_entry(user_id="default", ticker=ticker)
-# Source second — roll back if it raises.
-try:
-    await source.add_ticker(ticker)
-except Exception:
-    await delete_watchlist_entry(entry_id)
-    raise HTTPException(500, "Could not start tracking this ticker.")
-```
-
-The actual implementation does:
-
-```python
-added = db.watchlist.add_ticker(ticker)  # DB first ✓
-if not added:
-    raise HTTPException(409, ...)
-await state.market_source.add_ticker(ticker)  # No try/except, no rollback ✗
-```
-
-If `market_source.add_ticker()` raises, the DB row has been written but the live market source hasn't added the ticker. On the next restart, the DB seed will re-add it to the source — so this is recoverable — but until restart, the watchlist DB and live price stream are inconsistent.
-
-Similarly, `remove_watchlist` does not check for open positions before calling `source.remove_ticker()` (`MARKET_DATA_DESIGN.md §11.3`). A user holding shares of a removed watchlist ticker would have its price tracking stopped, producing stale portfolio valuations.
-
-This issue was also flagged as HIGH in `planning/REVIEW.md` (finding #2).
-
-**Fix:** Wrap `market_source.add_ticker` / `remove_ticker` in try/except with DB rollback. Add position check before source removal.
-
----
-
-### 4.4 Interface Docstring Contradicts All Implementations (Severity: Low)
-
-**File:** `backend/app/market/interface.py:31-32`
-
-```python
-@abstractmethod
 async def start(self, tickers: list[str]) -> None:
-    """Begin producing price updates for the given tickers.
-
-    Starts a background task that periodically writes to the PriceCache.
-    Must be called exactly once. Calling start() twice is undefined behavior.
-    """
+    """...Must be called exactly once. Calling start() twice is undefined behavior."""
 ```
 
-Both `SimulatorDataSource.start()` and `MassiveDataSource.start()` are idempotent (`if self._task is not None: return`). The design doc (`MARKET_DATA_DESIGN.md §4`) says start "Must be idempotent: start → start is a no-op on the second call." The ABC docstring actively misleads future implementers.
+Both `SimulatorDataSource.start()` and `MassiveDataSource.start()` are idempotent (`if self._task is not None: return`). The design doc (`MARKET_DATA_DESIGN.md §4`) says start "Must be idempotent: start → start is a no-op on the second call." Tests verify this. The docstring actively misleads future implementers.
 
-**Fix:** Update the docstring to say start is idempotent and a second call is a no-op.
+**Fix:** Update docstring to say start is idempotent and a second call is a no-op.
 
----
-
-### 4.5 `add_watchlist` Returns `price=None` After Eager Cache Seed (Severity: Low)
+### 4.6 `add_watchlist` Returns `price=None` After Eager Cache Seed (Severity: LOW)
 
 **File:** `backend/app/watchlist_api.py:73-76`
 
@@ -185,114 +216,98 @@ return WatchlistEntry(
 )
 ```
 
-`SimulatorDataSource.add_ticker()` eagerly seeds the cache before returning, so a price IS available immediately after the call. The route could return it:
+`SimulatorDataSource.add_ticker()` eagerly seeds the cache before returning, so a price IS available immediately. The route could read it from the cache and return it. The frontend instead shows `—` for the new ticker until the next SSE frame arrives, even though the data is already there.
 
-```python
-await state.market_source.add_ticker(ticker)
-quote = state.price_cache.get(ticker)
-return WatchlistEntry(
-    ticker=ticker,
-    price=quote.price if quote else None,
-    ...
-)
-```
+**Fix:** Read from `state.price_cache.get(ticker)` after `add_ticker()` and populate the response.
 
-This is a minor UX issue: the frontend shows `—` for the new ticker until the next SSE frame, even though the price is already in the cache.
+### 4.7 `DEFAULT_CORR` Defined But Never Used (Severity: LOW)
 
----
+**File:** `backend/app/market/seed_prices.py:48` and `backend/app/market/simulator.py:207`
 
-### 4.6 `DEFAULT_CORR` vs `CROSS_GROUP_CORR` Naming Ambiguity (Severity: Low)
+`DEFAULT_CORR = 0.3` is defined in `seed_prices.py` and imported in `simulator.py`, but `GBMSimulator._pairwise_correlation` actually returns `DEFAULT_CORR` as the fallback (line 207). Wait — re-checking the code: it does return `DEFAULT_CORR` on line 207 for the unknown-vs-unknown case. However, the comment on `CROSS_GROUP_CORR` says "Between sectors / unknown tickers" which overlaps with `DEFAULT_CORR`'s purpose ("Unknown vs unknown"). Both are 0.3, so behavior is correct, but the naming is confusing — if the constants were ever tuned independently, the overlap in semantics would cause bugs.
 
-**File:** `backend/app/market/seed_prices.py:46-48`
+**Fix:** Clarify the distinction in comments, or collapse into one constant if they should always be equal.
 
-```python
-CROSS_GROUP_CORR = 0.3  # Between sectors / unknown tickers
-TSLA_CORR = 0.3  # TSLA does its own thing
-DEFAULT_CORR = 0.3  # Unknown vs unknown
-```
+### 4.8 Seed Price Discrepancies vs Design Doc (Severity: LOW)
 
-`DEFAULT_CORR` is defined but never used. `GBMSimulator._pairwise_correlation` returns `CROSS_GROUP_CORR` for all non-matched pairs — which is semantically the same value (0.3) but could become confusing if the constants are ever tuned separately. This was flagged in the archive review and remains.
+**File:** `backend/app/market/seed_prices.py` vs `planning/MARKET_DATA_DESIGN.md §5`
 
-**Fix:** Either remove `DEFAULT_CORR` and update the `_pairwise_correlation` fallback comment, or actually use it as the fallback case.
+Minor parameter differences between the implementation and the design document:
 
----
+| Ticker | Design `mu` | Code `mu` | Design `sigma` | Code `sigma` | Design seed | Code seed |
+|---|---|---|---|---|---|---|
+| AAPL | 0.08 | 0.05 | 0.22 | 0.22 | $190 | $190 |
+| GOOGL | 0.07 | 0.05 | 0.24 | 0.25 | $175 | $175 |
+| AMZN | 0.06 | 0.05 | 0.28 | 0.28 | $180 | $185 |
+| NVDA | 0.08 | 0.08 | 0.42 | 0.40 | $800 | $800 |
+| META | 0.07 | 0.05 | 0.30 | 0.30 | $500 | $500 |
+| JPM | 0.05 | 0.04 | 0.18 | 0.18 | $195 | $195 |
+| V | 0.06 | 0.04 | 0.17 | 0.17 | $275 | $280 |
+| NFLX | 0.05 | 0.05 | 0.32 | 0.35 | $620 | $600 |
 
-### 4.7 Test: `test_no_simulator_seed_is_non_deterministic` Is Unreliable (Severity: Low)
+None of these differences are functionally significant — the simulator produces plausible paths either way. But the drift parameters are notably more conservative in the implementation (most set to 0.05 vs the design's 0.06-0.08), which means prices drift upward more slowly than the design intended.
 
-**File:** `backend/tests/market/test_simulator_source.py:172-196`
-
-```python
-async def test_no_simulator_seed_is_non_deterministic(self):
-    ...
-    await src_a.start(["AAPL"])
-    # Drive several steps manually so prices diverge
-    for _ in range(50):
-        src_a._sim.step()
-    prices_a = cache_a.get_price("AAPL")
-    await src_a.stop()
-```
-
-`src_a._sim.step()` advances the simulator's internal price state but **does not write to the cache**. The cache is only updated by the `_run_loop` background task. With `update_interval=10.0`, the background task won't fire within the test's runtime. So `cache_a.get_price("AAPL")` returns the initial seed price (190.00) from `start()`, not the stepped price.
-
-Since AAPL's seed price is hardcoded in `SEED_PRICES` at 190.00, **both** `prices_a` and `prices_b` will always be 190.00, and `assert prices_a != prices_b` would fail deterministically. This test passed in prior runs likely because it was not properly exercised, or the background task happened to fire exactly once — neither of which is reliable.
-
-**Fix:** Either compare the internal simulator prices (`src_a._sim.get_price("AAPL")`) instead of the cache, or use `asyncio.sleep` to let the background loop fire before reading the cache.
+**Fix:** Decide which values are canonical and synchronize. If the implementation values were deliberately tuned, update the design doc.
 
 ---
 
-## 5. Missing Test Coverage (Design Doc §12.7 Gaps)
+## 5. Missing Test Coverage
 
-These gaps were identified in the design documentation and remain unimplemented:
+Gaps identified in the design documentation (`MARKET_DATA_DESIGN.md §12.7`) and from this review:
 
-| Gap | Notes |
-|---|---|
-| Compensating rollback test for `add_ticker` / `remove_ticker` raising | Required by design §12.7; no failure-injection test exists |
-| Full 10-ticker simulator smoke test | All tests use 1–2 tickers; the full Cholesky path for 10 tickers is untested |
-| Event-shock frequency statistical test | No test verifies observed shock rate ≈ `event_probability` over 10K+ steps |
-| Explicit test for `_parse_timestamp(None)` | Edge case covered by code, not by test |
-| Position-aware watchlist removal test | No test verifies that removing a ticker from the watchlist while holding a position does not stop price tracking |
+| Gap | Status | Notes |
+|---|---|---|
+| Compensating rollback test for `add_ticker` / `remove_ticker` raising | Missing | Required by design §12.7 |
+| Full 10-ticker simulator smoke test | Missing | All tests use 1–2 tickers; full Cholesky path untested |
+| Event-shock frequency statistical test | Missing | No test verifies observed shock rate ≈ `event_probability` over 10K+ steps |
+| Position-aware watchlist removal test | Missing | No test checks that removing a watchlist ticker while holding shares keeps price tracking active |
+| `_parse_timestamp(None)` edge case | Missing | Covered by code, not by test |
+| SSE empty-cache behavior | **Broken** | Test hangs — effectively no SSE coverage in CI |
+| SSE no-change-no-emit behavior | **Blocked** | Cannot run due to hanging test above |
 
 ---
 
-## 6. Things Done Well
+## 6. Code Quality Observations
 
-| Area | Assessment |
-|---|---|
-| GBM formula | Correctly implements log-normal: `exp((mu - 0.5σ²)dt + σ√dt·Z)` |
-| Cholesky correlation | Mathematically correct; sector groups are reasonable |
-| Event shocks | 0.001/tick creates visible but not dominating drama; correctly multiplicative |
-| PriceCache concurrency | `threading.Lock` around all reads and writes; version under lock |
-| PriceCache snapshot | `get_all()` returns a shallow copy — safe to iterate outside lock |
-| Idempotent lifecycle | `start()`/`stop()` on both sources are safe to call twice |
-| Eager cache seeding | SimulatorDataSource seeds on `start()` and `add_ticker()` — no blank first frame |
-| Exception resilience | `_run_loop` and `_poll_once` both catch all exceptions and continue |
-| SSE version gating | Frames only emitted when `cache.version != last_version` |
-| SSE wire format | Matches PLAN.md §8 exactly (array, all required fields) |
-| Factory env routing | Clean, matches PLAN.md §5 env var spec |
-| Massive 429 handling | 60s cooldown correctly set on `asyncio.get_event_loop().time()` |
-| Massive malformed snap | `AttributeError`/`TypeError`/`ValueError` caught per-ticker; siblings unaffected |
-| Module public API | `__init__.py` exports exactly the five public names |
-| Test structure | Well-organized `Test*` classes; good fixture reuse; async tests properly marked |
-| Correlation test | Statistical test over 5,000 steps verifies co-movement above random baseline |
+### Well-executed patterns
+
+- **Thread-safe cache with version counter** — elegant solution to the "event-driven without pub/sub" problem. SSE polls at 500ms but only serializes on change. Massive's 15s poll cadence means 29/30 SSE loops are no-ops, as intended.
+- **`asyncio.Lock` in SimulatorDataSource** — correctly guards concurrent `step()` and `add/remove` against Cholesky shape mismatch. Not needed for the cache (which has its own `threading.Lock`), but essential for the simulator's internal arrays.
+- **Cancellation hygiene** — `_run_loop`, `_poll_loop`, and `_generate_events` all catch `CancelledError` cleanly and re-raise where appropriate. No swallowed cancellations that would hang shutdown.
+- **`to_thread` for Massive SDK** — correct choice since the Polygon/Massive SDK is synchronous. `threading.Lock` on the cache covers this path.
+- **`create_stream_router` as a factory** — avoids module-level state and allows independent test instances. Previous review's footgun is fixed.
+
+### Minor style notes
+
+- `simulator.py` imports `DEFAULT_CORR` from `seed_prices.py` but the fallback case in `_pairwise_correlation` returns it correctly. However, `CROSS_GROUP_CORR` is used for cross-sector cases that include one known group member, while `DEFAULT_CORR` is for two completely unknown tickers. The semantic distinction is correct but could be clearer.
+- The `_fetch_snapshots` method in `massive_client.py` does a second lazy import (`from massive.rest.models import SnapshotMarketType`). This is called on every poll cycle in a thread. The import is cached by Python after the first call, so the overhead is negligible, but moving it to `start()` alongside the `RESTClient` import would be cleaner.
 
 ---
 
 ## 7. Verdict
 
-**The market data backend is production-quality for the capstone's scope.** The architecture is clean, the GBM math is correct, and the test coverage for happy paths is thorough. The design document was carefully followed with all previously flagged issues resolved.
+**The market data backend is well-engineered and production-ready for the simulator path.** The architecture is clean, the GBM math is correct, thread safety is sound, and the test coverage for happy paths is thorough. All issues from the prior review (2026-02-10) have been resolved.
 
-**Must fix before Massive mode goes live:**
-1. **Timestamp divisor** (§4.1) — divide by `1e9`, not `1000`; update `test_timestamp_conversion` to use nanosecond input
+### Must fix
 
-**Should fix:**
-2. **Watchlist atomicity** (§4.3) — add try/except rollback in `add_watchlist` / `remove_watchlist`, check for position before stopping tracker
-3. **Unreliable test** (§4.7) — fix `test_no_simulator_seed_is_non_deterministic` to compare simulator-internal prices or yield to the event loop
-4. **Interface docstring** (§4.4) — update `start()` docstring to say it is idempotent
+1. **Timestamp divisor** (§4.1) — divide by `1e9`, not `1000`; rename to `_ns_to_seconds`; update test to use nanosecond input. **This is a data corruption bug in Massive mode.**
+2. **Hanging stream test** (§4.2) — `test_empty_cache_emits_no_data_frames` blocks the entire stream test suite from running in CI.
 
-**Nice to have:**
-5. Return live price from `add_watchlist` after eager seed (§4.5)
-6. Remove or use `DEFAULT_CORR` (§4.6)
-7. Add the three missing test coverage areas from §12.7
+### Should fix
 
-**Not needed:**
-- The factory lazy-import question (§4.2) is a matter of design philosophy; since `massive` is already a core dependency, the eager import is arguably cleaner. No action required unless `massive` is made optional again.
+3. **Watchlist atomicity** (§4.3) — add try/except rollback around `market_source.add_ticker()` / `remove_ticker()`; check for open position before stopping price tracking on removal. Flagged in two prior reviews and still open.
+4. **Broken non-determinism test** (§1.1) — `test_no_simulator_seed_is_non_deterministic` fails deterministically; compare internal simulator prices, not cache.
+5. **Interface docstring** (§4.5) — update `start()` docstring to match idempotent implementations and design spec.
+
+### Nice to have
+
+6. Return live price from `add_watchlist` after eager seed (§4.6)
+7. Restore lazy import in factory or document `massive` as a required dependency (§4.4)
+8. Synchronize seed price parameters between code and design doc (§4.8)
+9. Clarify `DEFAULT_CORR` vs `CROSS_GROUP_CORR` naming (§4.7)
+10. Add the three missing test coverage areas from design §12.7
+
+### No action required
+
+- Factory lazy-import (§4.4) is a design philosophy question; since `massive` is already a core dep, the eager import is defensible. Document the decision either way.
+- The prior review's `ruff` lint warnings appear to have been cleaned up; no new lint issues observed.
