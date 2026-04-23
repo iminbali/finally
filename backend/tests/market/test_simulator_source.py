@@ -1,6 +1,8 @@
 """Integration tests for SimulatorDataSource."""
 
 import asyncio
+import os
+from unittest.mock import patch
 
 import pytest
 
@@ -136,3 +138,59 @@ class TestSimulatorDataSource:
         # Just verify it starts and stops cleanly
         await asyncio.sleep(0.2)
         await source.stop()
+
+    async def test_start_is_idempotent(self):
+        """Calling start() twice should not start a second background task."""
+        cache = PriceCache()
+        source = SimulatorDataSource(price_cache=cache, update_interval=1.0)
+        await source.start(["AAPL"])
+        first_task = source._task
+
+        await source.start(["GOOGL"])  # second call should be a no-op
+        assert source._task is first_task
+
+        await source.stop()
+
+    async def test_simulator_seed_produces_deterministic_initial_prices(self):
+        """SIMULATOR_SEED env var should produce repeatable initial prices."""
+        with patch.dict(os.environ, {"SIMULATOR_SEED": "42"}):
+            cache_a = PriceCache()
+            src_a = SimulatorDataSource(price_cache=cache_a, update_interval=10.0)
+            await src_a.start(["AAPL", "GOOGL"])
+            prices_a = {t: cache_a.get_price(t) for t in src_a.get_tickers()}
+            await src_a.stop()
+
+        with patch.dict(os.environ, {"SIMULATOR_SEED": "42"}):
+            cache_b = PriceCache()
+            src_b = SimulatorDataSource(price_cache=cache_b, update_interval=10.0)
+            await src_b.start(["AAPL", "GOOGL"])
+            prices_b = {t: cache_b.get_price(t) for t in src_b.get_tickers()}
+            await src_b.stop()
+
+        assert prices_a == prices_b
+
+    async def test_no_simulator_seed_is_non_deterministic(self):
+        """Without SIMULATOR_SEED, two sources should very likely produce different prices."""
+        with patch.dict(os.environ, {}, clear=False):
+            # Remove SIMULATOR_SEED if set
+            os.environ.pop("SIMULATOR_SEED", None)
+
+            cache_a = PriceCache()
+            src_a = SimulatorDataSource(price_cache=cache_a, update_interval=10.0)
+            await src_a.start(["AAPL"])
+            # Drive several steps manually so prices diverge
+            for _ in range(50):
+                src_a._sim.step()
+            prices_a = cache_a.get_price("AAPL")
+            await src_a.stop()
+
+            cache_b = PriceCache()
+            src_b = SimulatorDataSource(price_cache=cache_b, update_interval=10.0)
+            await src_b.start(["AAPL"])
+            for _ in range(50):
+                src_b._sim.step()
+            prices_b = cache_b.get_price("AAPL")
+            await src_b.stop()
+
+        # With overwhelming probability, un-seeded sources diverge after 50 steps
+        assert prices_a != prices_b

@@ -63,8 +63,9 @@ class PriceCache:
 
     @property
     def version(self) -> int:
-        """Current version counter. Useful for SSE change detection."""
-        return self._version
+        """Current version counter. Read under lock for no-GIL (3.13t+) safety."""
+        with self._lock:
+            return self._version
 
     def __len__(self) -> int:
         with self._lock:

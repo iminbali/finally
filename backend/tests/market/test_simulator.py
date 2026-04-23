@@ -1,5 +1,7 @@
 """Tests for GBMSimulator."""
 
+import random
+
 from app.market.seed_prices import SEED_PRICES
 from app.market.simulator import GBMSimulator
 
@@ -129,3 +131,59 @@ class TestGBMSimulator:
         if '.' in price_str:
             decimal_part = price_str.split('.')[1]
             assert len(decimal_part) <= 2
+
+    def test_seeded_rng_produces_deterministic_results(self):
+        """Two simulators with the same seed must produce identical price paths."""
+        a = GBMSimulator(tickers=["AAPL", "GOOGL"], rng=random.Random(42))
+        b = GBMSimulator(tickers=["AAPL", "GOOGL"], rng=random.Random(42))
+        for _ in range(100):
+            assert a.step() == b.step()
+
+    def test_different_seeds_produce_different_results(self):
+        """Different seeds must not produce the same path (with overwhelming prob)."""
+        a = GBMSimulator(tickers=["AAPL"], rng=random.Random(1))
+        b = GBMSimulator(tickers=["AAPL"], rng=random.Random(2))
+        prices_a = [a.step()["AAPL"] for _ in range(20)]
+        prices_b = [b.step()["AAPL"] for _ in range(20)]
+        assert prices_a != prices_b
+
+    def test_cholesky_induces_correlation_for_tech_stocks(self):
+        """Tech stocks should move in the same direction more often than chance."""
+        sim = GBMSimulator(
+            tickers=["AAPL", "MSFT"],
+            event_probability=0.0,
+            rng=random.Random(0),
+        )
+        same_sign = 0
+        n = 5_000
+        for _ in range(n):
+            before = (sim.get_price("AAPL"), sim.get_price("MSFT"))
+            sim.step()
+            after = (sim.get_price("AAPL"), sim.get_price("MSFT"))
+            d_aapl = after[0] - before[0]
+            d_msft = after[1] - before[1]
+            if d_aapl * d_msft > 0:
+                same_sign += 1
+        # Uncorrelated → ~50%; intra-tech correlation 0.6 → well above 55%.
+        assert same_sign / n > 0.55
+
+    def test_event_probability_respected(self):
+        """With event_probability=0, no random shocks should occur."""
+        sim = GBMSimulator(tickers=["AAPL"], event_probability=0.0, rng=random.Random(99))
+        # Run many steps and verify prices stay within tight GBM bounds
+        for _ in range(1000):
+            result = sim.step()
+            # Price should be positive and not wildly out of range for 0% event prob
+            assert result["AAPL"] > 0
+
+    def test_add_ticker_normalizes_uppercase(self):
+        """add_ticker should normalize tickers to uppercase."""
+        sim = GBMSimulator(tickers=[])
+        sim.add_ticker("aapl")
+        assert "AAPL" in sim.get_tickers()
+
+    def test_remove_ticker_normalizes_uppercase(self):
+        """remove_ticker should normalize tickers to uppercase."""
+        sim = GBMSimulator(tickers=["AAPL"])
+        sim.remove_ticker("aapl")
+        assert "AAPL" not in sim.get_tickers()

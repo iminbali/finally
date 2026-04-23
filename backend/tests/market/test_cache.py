@@ -1,5 +1,7 @@
 """Tests for PriceCache."""
 
+import threading
+
 from app.market.cache import PriceCache
 
 
@@ -107,3 +109,33 @@ class TestPriceCache:
         cache = PriceCache()
         update = cache.update("AAPL", 190.12345)
         assert update.price == 190.12
+
+    def test_get_all_is_shallow_copy(self):
+        """Mutations to the get_all() result must not affect the cache."""
+        cache = PriceCache()
+        cache.update("AAPL", 190.0)
+        snap = cache.get_all()
+        snap["FAKE"] = None  # type: ignore[assignment]
+        assert "FAKE" not in cache.get_all()
+
+    def test_concurrent_writers_do_not_corrupt_state(self):
+        """Two threads writing different tickers should never corrupt state."""
+        cache = PriceCache()
+        n = 5_000
+
+        def writer(ticker: str) -> None:
+            for i in range(n):
+                cache.update(ticker, float(i))
+
+        t1 = threading.Thread(target=writer, args=("AAPL",))
+        t2 = threading.Thread(target=writer, args=("GOOGL",))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        # Each writer wrote n values; final price is the last one written.
+        assert cache.get_price("AAPL") == float(n - 1)
+        assert cache.get_price("GOOGL") == float(n - 1)
+        # Version must have been bumped at least 2n times (one per write each thread).
+        assert cache.version >= 2 * n
