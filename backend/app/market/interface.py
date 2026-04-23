@@ -27,7 +27,7 @@ class MarketDataSource(ABC):
         """Begin producing price updates for the given tickers.
 
         Starts a background task that periodically writes to the PriceCache.
-        Must be called exactly once. Calling start() twice is undefined behavior.
+        Idempotent: calling start() on an already-started source is a no-op.
         """
 
     @abstractmethod

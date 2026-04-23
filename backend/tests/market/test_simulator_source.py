@@ -178,10 +178,12 @@ class TestSimulatorDataSource:
             cache_a = PriceCache()
             src_a = SimulatorDataSource(price_cache=cache_a, update_interval=10.0)
             await src_a.start(["AAPL"])
-            # Drive several steps manually so prices diverge
+            # Drive several steps manually so internal prices diverge.
+            # Note: step() updates internal state but not the cache, so we
+            # compare simulator-internal prices, not cache values.
             for _ in range(50):
                 src_a._sim.step()
-            prices_a = cache_a.get_price("AAPL")
+            price_a = src_a._sim.get_price("AAPL")
             await src_a.stop()
 
             cache_b = PriceCache()
@@ -189,8 +191,8 @@ class TestSimulatorDataSource:
             await src_b.start(["AAPL"])
             for _ in range(50):
                 src_b._sim.step()
-            prices_b = cache_b.get_price("AAPL")
+            price_b = src_b._sim.get_price("AAPL")
             await src_b.stop()
 
         # With overwhelming probability, un-seeded sources diverge after 50 steps
-        assert prices_a != prices_b
+        assert price_a != price_b

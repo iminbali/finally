@@ -6,12 +6,16 @@ so price updates flow (or stop) for the new set immediately.
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from . import db
 from .state import AppState, get_state
 from .validation import normalize_ticker
+
+logger = logging.getLogger(__name__)
 
 
 class WatchlistAddRequest(BaseModel):
@@ -69,10 +73,25 @@ async def add_watchlist(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"{ticker} is already in the watchlist",
         )
-    await state.market_source.add_ticker(ticker)
+    # DB first, source second — roll back if source fails.
+    try:
+        await state.market_source.add_ticker(ticker)
+    except Exception:
+        db.watchlist.remove_ticker(ticker)
+        logger.exception("add_ticker failed for %s; DB change rolled back", ticker)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not start tracking this ticker. Please try again.",
+        )
+    # Return live price if the source eagerly seeded the cache.
+    quote = state.price_cache.get(ticker)
     return WatchlistEntry(
-        ticker=ticker, price=None, previous_price=None,
-        change=None, change_percent=None, direction=None,
+        ticker=ticker,
+        price=quote.price if quote else None,
+        previous_price=quote.previous_price if quote else None,
+        change=quote.change if quote else None,
+        change_percent=quote.change_percent if quote else None,
+        direction=quote.direction if quote else None,
     )
 
 
@@ -87,4 +106,17 @@ async def remove_watchlist(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"{ticker} is not in the watchlist",
         )
-    await state.market_source.remove_ticker(ticker)
+    # Only stop tracking if the user doesn't hold shares — otherwise
+    # portfolio valuation would show stale prices.
+    position = db.positions.get_position(ticker)
+    if position is None or position.quantity == 0:
+        try:
+            await state.market_source.remove_ticker(ticker)
+        except Exception:
+            # Roll back the DB change to keep watchlist and source in sync.
+            db.watchlist.add_ticker(ticker)
+            logger.exception("remove_ticker failed for %s; DB change rolled back", ticker)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Could not stop tracking this ticker. Please try again.",
+            )

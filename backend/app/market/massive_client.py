@@ -15,16 +15,15 @@ logger = logging.getLogger(__name__)
 _RATE_LIMIT_COOLDOWN_S = 60.0
 
 
-def _parse_timestamp(ts: int | float | None) -> float | None:
-    """Convert a Massive snapshot timestamp to Unix seconds.
+def _ns_to_seconds(ts: int | float | None) -> float | None:
+    """Convert a Massive snapshot timestamp from nanoseconds to Unix seconds.
 
-    Snapshot timestamps may be in milliseconds (ms) from the Massive SDK.
-    We convert to seconds for the PriceCache.
+    Snapshot timestamps (tickers[i].updated, tickers[i].lastTrade.t) are
+    nanoseconds since epoch. Dividing by 1e9 gives standard Unix seconds.
     """
     if ts is None:
         return None
-    # Massive SDK returns milliseconds; divide by 1000 to get seconds.
-    return float(ts) / 1000.0
+    return float(ts) / 1e9
 
 
 class MassiveDataSource(MarketDataSource):
@@ -131,7 +130,7 @@ class MassiveDataSource(MarketDataSource):
                     if not ticker or last_trade is None:
                         continue
                     price = float(last_trade.price)
-                    timestamp = _parse_timestamp(
+                    timestamp = _ns_to_seconds(
                         getattr(last_trade, "timestamp", None)
                         or getattr(snap, "updated", None)
                     )
