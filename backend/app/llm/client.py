@@ -15,8 +15,7 @@ from .schema import LLMResponse
 
 logger = logging.getLogger(__name__)
 
-MODEL = "openrouter/openai/gpt-oss-120b"
-EXTRA_BODY = {"provider": {"order": ["cerebras"]}}
+MODEL = "openrouter/openai/gpt-4o-mini"
 MOCK_ENV = "LLM_MOCK"
 API_KEY_ENV = "OPENROUTER_API_KEY"
 
@@ -46,8 +45,6 @@ def complete_chat(messages: list[dict[str, str]], user_message: str) -> LLMRespo
         model=MODEL,
         messages=messages,
         response_format=LLMResponse,
-        reasoning_effort="low",
-        extra_body=EXTRA_BODY,
     )
     raw = response.choices[0].message.content
     return LLMResponse.model_validate_json(raw)
